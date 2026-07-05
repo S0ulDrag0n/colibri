@@ -48,9 +48,9 @@ The engine is a single C file (`c/glm.c`, ~1,300 lines) plus small headers. No B
 This is not fast. It is a 744B frontier-class model **answering correctly on a machine that costs less than one H100 fan**. Warm cache, pinned hot experts and MTP push the useful-response latency down considerably; the physics of the disk does the rest.
 
 ### SSD Wear Warning
-Cold starts are heavy on random reads. While reads are mostly safe, the OS page cache can cause writes. Heavy use may accelerate SSD wear, especially on cheaper drives. Use with caution and monitor your drive health.
+Cold starts are heavy on random reads (~11 GB/token). Reads themselves are safe, but the OS page cache can generate writes. Heavy use may accelerate wear on cheaper SSDs. Use with caution and monitor your drive health.
 
-## Quick start
+### Quick start
 
 ```bash
 cd c
