@@ -1350,7 +1350,11 @@ int main(int argc, char **argv){
       if(hist>0) fprintf(stderr,"[USAGE] storia expert: %lld selezioni (%s)\n",(long long)hist,g_usage_path);
       int autopin = getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
       if(!getenv("PIN") && autopin && hist>=5000){
-          double pin_gb = expert_avail(&m,ram_env,ebits,est_ctx)*0.5/1e9;
+          /* quota pin proporzionale alla FIDUCIA nella storia: con pochi dati il pin
+           * sbaglia expert e ruba slot alla LRU adattiva; a regime (>=200k selezioni,
+           * qualche ora di chat) arriva a meta' del budget expert. */
+          double conf = (double)hist/200000.0; if(conf>1) conf=1;
+          double pin_gb = expert_avail(&m,ram_env,ebits,est_ctx)*0.5*conf/1e9;
           if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb);
       }
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
