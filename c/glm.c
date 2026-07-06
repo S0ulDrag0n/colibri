@@ -725,7 +725,13 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
 static void layers_forward(Model *m, float *x, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
-    for(int i=0;i<c->n_layers;i++) layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
+    for(int i=0;i<c->n_layers;i++){
+        /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
+         * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
+        if(S>=8 && (i%4==0 || i==c->n_layers-1))
+            fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
+        layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
+    }
     free(nrm); free(tmp);
 }
 

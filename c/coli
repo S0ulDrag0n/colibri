@@ -106,14 +106,20 @@ def env_for(a):
 
 class Spinner:
     FRAMES=["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
-    def __init__(self,label): self.label=label; self.stop_evt=threading.Event(); self.t0=time.time(); self.th=None
+    def __init__(self,label,tick=None):
+        self.label=label; self.tick=tick; self.suffix=""
+        self.stop_evt=threading.Event(); self.t0=time.time(); self.th=None
     def start(self):
         if not TTY: return
         def run():
             i=0
             while not self.stop_evt.is_set():
                 el=time.time()-self.t0
-                sys.stdout.write(f"\r  {C.teal}{self.FRAMES[i%10]}{C.r} {C.dim}{self.label} {el:.0f}s{C.r}\033[K")
+                if self.tick and i%8==0:              # ~1 Hz: legge il progresso dal log
+                    try: self.suffix=self.tick() or self.suffix
+                    except Exception: pass
+                suf=f" {C.dgray}· {self.suffix}{C.r}" if self.suffix else ""
+                sys.stdout.write(f"\r  {C.teal}{self.FRAMES[i%10]}{C.r} {C.dim}{self.label} {el:.0f}s{C.r}{suf}\033[K")
                 sys.stdout.flush(); i+=1; time.sleep(0.12)
         self.th=threading.Thread(target=run,daemon=True); self.th.start()
     def stop(self):
@@ -244,7 +250,14 @@ def cmd_chat(a):
             print(f"\n  {C.teal}◆ colibrì{C.r}")
             dec=codecs.getincrementaldecoder("utf-8")("replace")
             state={"first":True}
-            sp2=Spinner("pensa…"); sp2.start()
+            def prefill_tick(path=errlog.name):
+                try:
+                    with open(path) as f:
+                        f.seek(max(0, os.path.getsize(path)-1500)); tail=f.read()
+                    pl=[l for l in tail.splitlines() if l.startswith("[prefill]")]
+                    return pl[-1].replace("[prefill] ","prefill ") if pl else ""
+                except Exception: return ""
+            sp2=Spinner("pensa…", tick=prefill_tick); sp2.start()
             def echo(bs, _dec=dec, _st=state):
                 if _st["first"]:
                     sp2.stop(); _st["first"]=False
