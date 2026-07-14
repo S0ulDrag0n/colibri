@@ -114,6 +114,11 @@ ifneq ($(IS_WIN),)
 # directory too is symmetric. The installer adds it by default.
 CUDA_HOME ?= $(subst \,/,$(CUDA_PATH))
 NVCC      ?= nvcc
+# Host compiler override for nvcc (e.g. Fedora ships g++16 but CUDA needs 15):
+#   make glm CUDA=1 NVCC_CCBIN=g++-15        (opt-in: unset = nvcc's own default)
+ifneq ($(NVCC_CCBIN),)
+NVCCFLAGS += -ccbin $(NVCC_CCBIN)
+endif
 else
 CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
