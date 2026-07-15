@@ -37,6 +37,9 @@
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
 #endif
 #include "st.h"
+#ifdef __linux__
+#include "uring.h"
+#endif
 #include "tok.h"
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
@@ -989,8 +992,9 @@ static int g_pilot_two=0; /* PILOT_TWO=1: two-step prefetch — before running L
  *     niente torn read di ecn[]/eid. Il pilota non altera MAI il valore di un expert, solo QUALE
  *     expert e' residente: con un load andato a buon fine l'output resta byte-identico all'OFF. */
 static pthread_mutex_t g_pilot_mx=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pilot_cv=PTHREAD_COND_INITIALIZER;
 static _Atomic int g_cur_moe_layer=-1;   /* massimo layer moe in cui il MAIN e' entrato (per forward) */
-static _Atomic int g_pilot_inflight=-1;  /* layer che il worker sta REAL-caricando adesso (-1 = idle) */
+static int g_pilot_inflight[256];        /* protected by g_pilot_mx; URING can load a layer concurrently */
 static _Atomic long g_pilot_loads=0;     /* load cross-layer VERI completati (banda spesa) */
 static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main possiede gia' il layer */
 /* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
@@ -1587,6 +1591,189 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
     s->eid=eid; return 0;
 }
 
+#ifdef __linux__
+/* io_uring expert batches.  One owner prepares all reads for a block, submits
+ * them in one syscall, and reaps CQEs on demand.  The kernel, rather than a set
+ * of blocking pthreads, owns the I/O concurrency. */
+#define URING_LOAD_MAX 64
+#define URING_REQ_MAX  512
+typedef struct {
+    int load, expect;
+} UringRead;
+typedef struct {
+    Model *m; ESlot *s; int layer,eid,fatal;
+    st_tensor *tw[3],*tq[3]; int64_t pos[3];
+    int pending,done,finalized,error;
+} UringLoad;
+typedef struct {
+    ColiUring ring;
+    UringLoad load[URING_LOAD_MAX];
+    UringRead req[URING_REQ_MAX];
+    int nload,nreq,started;
+} UringBatch;
+static UringBatch g_ub_pipe, g_ub_pilot;
+
+static int uring_batch_init(UringBatch *b){
+    if(b->started) return 0;
+    if(coli_uring_init(&b->ring,URING_REQ_MAX)) return -1;
+    b->started=1; return 0;
+}
+static void uring_batch_reset(UringBatch *b){
+    b->nload=0; b->nreq=0;
+}
+static int uring_load_error(UringLoad *l,int err,const char *what){
+    l->error=err?err:EIO; l->done=1;
+    if(l->fatal){ errno=l->error; perror(what); exit(1); }
+    return -1;
+}
+static int uring_add_read(UringBatch *b,int li,int fd,void *buf,size_t len,
+                          int64_t off,size_t expect){
+    if(b->nreq>=URING_REQ_MAX || expect>INT_MAX){ errno=E2BIG; return -1; }
+    int ri=b->nreq++;
+    b->req[ri]=(UringRead){li,(int)expect};
+    if(coli_uring_prep_read(&b->ring,fd,buf,len,off,(uint64_t)ri+1)) return -1;
+    b->load[li].pending++;
+    return 0;
+}
+/* Returns the load index. URING is intentionally a quantized streaming path;
+ * unsupported layouts fail instead of silently dropping back to pread. */
+static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int fatal){
+    if(b->nload>=URING_LOAD_MAX){ errno=E2BIG; return -1; }
+    int li=b->nload++;
+    UringLoad *l=&b->load[li]; memset(l,0,sizeof(*l));
+    l->m=m; l->s=s; l->layer=layer; l->eid=eid; l->fatal=fatal;
+    char nm[3][288],qn[300]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
+    snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
+    if(g_mmap || !st_has(&m->S,qn))
+        return uring_load_error(l,ENOTSUP,"URING requires quantized expert tensors"),li;
+#ifdef COLI_CUDA
+    if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+#endif
+    for(int k=0;k<3;k++){
+        l->tw[k]=st_find(&m->S,nm[k]);
+        size_t n=strnlen(nm[k],sizeof(nm[k]));
+        if(n+3>=sizeof(qn)) return uring_load_error(l,ENAMETOOLONG,"io_uring expert metadata"),li;
+        memcpy(qn,nm[k],n); memcpy(qn+n,".qs",4); l->tq[k]=st_find(&m->S,qn);
+        if(!l->tw[k]||!l->tq[k]) return uring_load_error(l,ENOENT,"io_uring expert metadata"),li;
+    }
+    int64_t wtot=l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes;
+    int64_t ftot=(l->tq[0]->nbytes+l->tq[1]->nbytes+l->tq[2]->nbytes)/4;
+    if(wtot<=0 || ftot<=0) return uring_load_error(l,EINVAL,"io_uring expert size"),li;
+    if(!s->slab || wtot+8192>s->slab_cap){
+#ifdef COLI_METAL
+        if(s->slab&&g_metal_enabled) coli_metal_unregister(s->slab);
+        compat_aligned_free(s->slab);
+        size_t need=((size_t)wtot+8192+16383)&~(size_t)16383;
+        if(posix_memalign((void**)&s->slab,16384,need)){
+            s->slab=NULL; s->slab_cap=0; return uring_load_error(l,ENOMEM,"io_uring expert slab"),li; }
+        s->slab_cap=need; if(g_metal_enabled) coli_metal_register(s->slab,need);
+#else
+        compat_aligned_free(s->slab);
+        if(posix_memalign((void**)&s->slab,4096,(size_t)wtot+8192)){
+            s->slab=NULL; s->slab_cap=0; return uring_load_error(l,ENOMEM,"io_uring expert slab"),li; }
+        s->slab_cap=wtot+8192;
+#endif
+    }
+    if(!s->fslab || ftot>s->fslab_cap){
+#ifdef COLI_METAL
+        if(s->fslab&&g_metal_enabled) coli_metal_unregister(s->fslab);
+        free(s->fslab); size_t fb=(((size_t)ftot*sizeof(float))+16383)&~(size_t)16383;
+        if(posix_memalign((void**)&s->fslab,16384,fb)){
+            s->fslab=NULL; s->fslab_cap=0; return uring_load_error(l,ENOMEM,"io_uring expert scales"),li; }
+        s->fslab_cap=ftot; if(g_metal_enabled) coli_metal_register(s->fslab,fb);
+#else
+        free(s->fslab); s->fslab=malloc((size_t)ftot*sizeof(float));
+        if(!s->fslab){ s->fslab_cap=0; return uring_load_error(l,ENOMEM,"io_uring expert scales"),li; }
+        s->fslab_cap=ftot;
+#endif
+    }
+    int ord[3]={0,1,2};
+    for(int a=0;a<3;a++) for(int z=a+1;z<3;z++) if(l->tw[ord[z]]->off<l->tw[ord[a]]->off){int t=ord[a];ord[a]=ord[z];ord[z]=t;}
+    int contig=l->tw[ord[0]]->fd==l->tw[ord[1]]->fd && l->tw[ord[1]]->fd==l->tw[ord[2]]->fd
+        && l->tw[ord[0]]->off+l->tw[ord[0]]->nbytes==l->tw[ord[1]]->off
+        && l->tw[ord[1]]->off+l->tw[ord[1]]->nbytes==l->tw[ord[2]]->off;
+    if(contig){
+        int64_t off0=l->tw[ord[0]]->off;
+        int dfd=g_direct?st_direct_fd(&m->S,l->tw[ord[0]]->fd):-1;
+        if(dfd>=0){
+            int64_t base=off0&~4095LL,need=(off0-base)+wtot,len=(need+4095)&~4095LL;
+            l->pos[ord[0]]=off0-base; l->pos[ord[1]]=l->pos[ord[0]]+l->tw[ord[0]]->nbytes;
+            l->pos[ord[2]]=l->pos[ord[1]]+l->tw[ord[1]]->nbytes;
+            if(uring_add_read(b,li,dfd,s->slab,(size_t)len,base,(size_t)need))
+                return uring_load_error(l,errno,"io_uring direct expert read"),li;
+        }else{
+            l->pos[ord[0]]=0; l->pos[ord[1]]=l->tw[ord[0]]->nbytes;
+            l->pos[ord[2]]=l->pos[ord[1]]+l->tw[ord[1]]->nbytes;
+            if(uring_add_read(b,li,l->tw[ord[0]]->fd,s->slab,(size_t)wtot,off0,(size_t)wtot))
+                return uring_load_error(l,errno,"io_uring expert read"),li;
+        }
+    }else{
+        int64_t o=0;
+        for(int a=0;a<3;a++){ int k=ord[a]; l->pos[k]=o;
+            if(uring_add_read(b,li,l->tw[k]->fd,s->slab+o,(size_t)l->tw[k]->nbytes,l->tw[k]->off,(size_t)l->tw[k]->nbytes))
+                return uring_load_error(l,errno,"io_uring expert read"),li;
+            o+=l->tw[k]->nbytes;
+        }
+    }
+    int64_t fo=0;
+    for(int k=0;k<3;k++){
+        if(uring_add_read(b,li,l->tq[k]->fd,s->fslab+fo,(size_t)l->tq[k]->nbytes,l->tq[k]->off,(size_t)l->tq[k]->nbytes))
+            return uring_load_error(l,errno,"io_uring expert scale read"),li;
+        fo+=l->tq[k]->nbytes/4;
+    }
+    return li;
+}
+static void uring_reap(UringBatch *b){
+    struct io_uring_cqe cqe;
+    while(coli_uring_peek(&b->ring,&cqe)){
+        if(!cqe.user_data || cqe.user_data>(uint64_t)b->nreq) continue;
+        UringRead *r=&b->req[cqe.user_data-1]; UringLoad *l=&b->load[r->load];
+        if(cqe.res<r->expect && !l->error) l->error=cqe.res<0?-cqe.res:EIO;
+        if(l->pending>0) l->pending--;
+        if(l->pending==0) l->done=1;
+    }
+}
+static int uring_submit_batch(UringBatch *b){
+    if(coli_uring_enter(&b->ring,0)<0) return -1;
+    uring_reap(b); return 0;
+}
+static int uring_wait_load(UringBatch *b,int li){
+    UringLoad *l=&b->load[li];
+    while(!l->done){
+        uring_reap(b); if(l->done) break;
+        if(coli_uring_enter(&b->ring,1)<0) return uring_load_error(l,errno,"io_uring wait");
+    }
+    return l->error?-1:0;
+}
+static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
+    UringLoad *l=&b->load[li]; ESlot *s=l->s;
+    if(l->finalized) return 0;
+    if(uring_wait_load(b,li)<0){ errno=l->error; if(l->fatal){perror("io_uring expert completion");exit(1);} return -1; }
+    if(g_drop){
+        int ord0=0; for(int k=1;k<3;k++) if(l->tw[k]->off<l->tw[ord0]->off) ord0=k;
+        int64_t wtot=l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes;
+        posix_fadvise(l->tw[ord0]->fd,l->tw[ord0]->off,wtot,POSIX_FADV_DONTNEED);
+        for(int k=0;k<3;k++) posix_fadvise(l->tq[k]->fd,l->tq[k]->off,l->tq[k]->nbytes,POSIX_FADV_DONTNEED);
+    }
+    Cfg *c=&l->m->c; int I=c->moe_inter,D=c->hidden; float *fp[3]; int64_t fo=0;
+    QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D},II[3]={D,D,I};
+    for(int k=0;k<3;k++){
+        fp[k]=s->fslab+fo; fo+=l->tq[k]->nbytes/4;
+        int64_t nb=l->tw[k]->nbytes;
+        int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
+        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
+        qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
+    }
+    if(publish_eid) s->eid=l->eid;
+    l->finalized=1; return 0;
+}
+static int uring_wait_all(UringBatch *b){
+    for(int i=0;i<b->nload;i++) if(uring_wait_load(b,i)<0) return -1;
+    return 0;
+}
+#endif
+
 /* ============================ PIPE: load ‖ matmul ============================
  * Overlap NVMe expert-weight loads with expert matmul. A small persistent pool
  * of I/O worker pthreads runs the misses' pread (expert_load) into distinct
@@ -1616,6 +1803,7 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
  * byte-identically. */
 static int g_pipe=0;      /* PIPE=1: async expert-load pipeline (default OFF) */
 static int g_pipe_nw=8;   /* PIPE_WORKERS=n: I/O worker threads (disk-parallel reads) */
+static int g_uring=0;     /* URING=1: Linux io_uring load/completion backend; implies PIPE */
 typedef struct {
     _Atomic uint64_t cur;                         /* (gen<<8)|index; gen main-only, index 0..njobs (≤64) */
     _Atomic int njobs;                            /* current batch job count */
@@ -1655,6 +1843,12 @@ static void *pipe_worker(void *arg){
 }
 static void pipe_init(Model *m){
     if(g_pp.started) return;
+#ifdef __linux__
+    if(g_uring){
+        if(uring_batch_init(&g_ub_pipe)){ perror("URING=1 io_uring_setup"); exit(1); }
+        g_pp.m=m; g_pp.started=1; return;
+    }
+#endif
     g_pp.m=m; g_pp.nw=g_pipe_nw; if(g_pp.nw>16) g_pp.nw=16; if(g_pp.nw<1) g_pp.nw=1;
     atomic_store(&g_pp.cur,0); atomic_store(&g_pp.njobs,0);
     pthread_mutex_init(&g_pp.mx,NULL); pthread_cond_init(&g_pp.cv,NULL);
@@ -1665,6 +1859,17 @@ static void pipe_init(Model *m){
  * Order is load-bearing: write all batch state RELAXED, then RELEASE-store cur to
  * publish it, then wake parked workers. */
 static void pipe_dispatch(Model *m,int layer,const int *eids,int njobs){
+#ifdef __linux__
+    if(g_uring){
+        uring_batch_reset(&g_ub_pipe);
+        for(int q=0;q<njobs;q++){
+            int li=uring_load_add(&g_ub_pipe,m,layer,eids[q],&m->ws[q],1);
+            if(li!=q){ fprintf(stderr,"URING: expert batch overflow\n"); exit(1); }
+        }
+        if(uring_submit_batch(&g_ub_pipe)){ perror("URING: submit"); exit(1); }
+        return;
+    }
+#endif
     g_pp.m=m;
     atomic_store_explicit(&g_pp.njobs,njobs,memory_order_relaxed);
     atomic_store_explicit(&g_pp.layer,layer,memory_order_relaxed);
@@ -1675,6 +1880,12 @@ static void pipe_dispatch(Model *m,int layer,const int *eids,int njobs){
     pthread_mutex_lock(&g_pp.mx); pthread_cond_broadcast(&g_pp.cv); pthread_mutex_unlock(&g_pp.mx);
 }
 static inline void pipe_wait(int q){
+#ifdef __linux__
+    if(g_uring){
+        if(uring_finalize_load(&g_ub_pipe,q,1)){ perror("URING: expert load"); exit(1); }
+        return;
+    }
+#endif
     while(!atomic_load_explicit(&g_pp.ready[q],memory_order_acquire)) sched_yield();
 }
 
@@ -2217,14 +2428,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                          * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
                          * worker droppa ogni nuovo load <= layer -> ecache[layer] e' stabile
                          * per tutto il resolve/matmul/promozione qui sotto). */
-        for(;;){
-            pthread_mutex_lock(&g_pilot_mx);
-            atomic_store_explicit(&g_cur_moe_layer,layer,memory_order_release);
-            int inf=atomic_load_explicit(&g_pilot_inflight,memory_order_acquire);
-            pthread_mutex_unlock(&g_pilot_mx);
-            if(inf!=layer) break;
-            sched_yield();
-        }
+        pthread_mutex_lock(&g_pilot_mx);
+        atomic_store_explicit(&g_cur_moe_layer,layer,memory_order_release);
+        while(layer>=0 && layer<256 && g_pilot_inflight[layer]>0)
+            pthread_cond_wait(&g_pilot_cv,&g_pilot_mx);
+        pthread_mutex_unlock(&g_pilot_mx);
     }
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
     float *choice=falloc(E);
@@ -2800,7 +3008,7 @@ static void pilot_realload(Model *m, int layer, int eid){
     else { int lru=0; for(int z=1;z<nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; slot=lru; isnew=0; }
     ESlot *dst=&Sl[slot];
     dst->eid=-1;                                        /* nascondi dagli scan-hint mentre carica */
-    atomic_store_explicit(&g_pilot_inflight,layer,memory_order_release);
+    g_pilot_inflight[layer]++;
     pthread_mutex_unlock(&g_pilot_mx);
 
     int rc=expert_load(m,layer,eid,dst,0);              /* pread VERO — fuori dal lock, sovrapposto al compute; fatal=0: un errore su una speculazione NON deve uccidere il server */
@@ -2813,18 +3021,96 @@ static void pilot_realload(Model *m, int layer, int eid){
     } else {
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); /* load fallito: slot resta nascosto (eid=-1), mai pubblicato */
     }
-    atomic_store_explicit(&g_pilot_inflight,-1,memory_order_release);
+    g_pilot_inflight[layer]--;
+    pthread_cond_broadcast(&g_pilot_cv);
     pthread_mutex_unlock(&g_pilot_mx);
     if(rc!=0)                                            /* mai swallow silenzioso: logga (una riga) e prosegui */
         fprintf(stderr,"[PILOT] load speculativo abbandonato: layer %d expert %d (I/O error/short read) — nessun impatto sull'output\n",layer,eid);
 }
+#ifdef __linux__
+typedef struct { int layer,eid,li; ESlot *dst; } PilotUringDone;
+static void pilot_uring_batch(Model *m){
+    PilotUringDone done[URING_LOAD_MAX]; int nd=0;
+    uring_batch_reset(&g_ub_pilot);
+    unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
+    unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
+    while(r!=w && nd<URING_LOAD_MAX){
+        int layer=pilot_q[r&4095].l,eid=pilot_q[r&4095].e; r++;
+        if(layer<0 || layer>=256){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); continue; }
+        pthread_mutex_lock(&g_pilot_mx);
+        if(layer<=atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
+            atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+            pthread_mutex_unlock(&g_pilot_mx); continue;
+        }
+        int found=0; ESlot *P=m->pin[layer];
+        for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){found=1;break;}
+        ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
+        for(int z=0;z<nn && !found;z++) if(Sl[z].eid==eid || Sl[z].eid==-(eid+2)) found=1;
+        if(found){ pthread_mutex_unlock(&g_pilot_mx); continue; }
+        int slot;
+        if(nn<m->ecap){ slot=nn; m->ecn[layer]=nn+1; }
+        else{
+            slot=-1;
+            for(int z=0;z<nn;z++){
+                if(Sl[z].eid==-1){ slot=z; break; }
+                if(Sl[z].eid< -1) continue;          /* URING reservation in flight */
+                if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
+            }
+        }
+        if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
+        ESlot *dst=&Sl[slot];
+        dst->eid=-(eid+2);                         /* visible reservation; never considered resident/evictable */
+        g_pilot_inflight[layer]++;
+        pthread_mutex_unlock(&g_pilot_mx);
+
+        int li=uring_load_add(&g_ub_pilot,m,layer,eid,dst,0);
+        if(li<0){
+            pthread_mutex_lock(&g_pilot_mx); dst->eid=-1; g_pilot_inflight[layer]--;
+            pthread_cond_broadcast(&g_pilot_cv); pthread_mutex_unlock(&g_pilot_mx);
+            atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); continue;
+        }
+        done[nd++]=(PilotUringDone){layer,eid,li,dst};
+    }
+    __atomic_store_n(&pilot_r,r,__ATOMIC_RELEASE);
+    if(!nd) return;
+    if(uring_submit_batch(&g_ub_pilot)<0){
+        int err=errno;
+        for(int i=0;i<g_ub_pilot.nload;i++){
+            g_ub_pilot.load[i].error=err; g_ub_pilot.load[i].done=1;
+        }
+    }
+    for(int i=0;i<nd;i++){
+        PilotUringDone *d=&done[i];
+        int rc=uring_finalize_load(&g_ub_pilot,d->li,0);
+        pthread_mutex_lock(&g_pilot_mx);
+        if(rc==0){
+            d->dst->eid=d->eid;
+            d->dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
+            atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
+        }else{
+            d->dst->eid=-1;
+            atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+        }
+        g_pilot_inflight[d->layer]--;
+        pthread_cond_broadcast(&g_pilot_cv);
+        pthread_mutex_unlock(&g_pilot_mx);
+        if(rc) fprintf(stderr,"[PILOT/URING] load speculativo abbandonato: layer %d expert %d: %s\n",
+                       d->layer,d->eid,strerror(g_ub_pilot.load[d->li].error));
+    }
+}
+#endif
 static void *pilot_worker(void *arg){
     (void)arg;
     for(;;){
         unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
         unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
         if(r==w){ usleep(200); continue; }
-        if(g_pilot_real) pilot_realload(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
+        if(g_pilot_real){
+#ifdef __linux__
+            if(g_uring){ pilot_uring_batch(pilot_m); continue; }
+#endif
+            pilot_realload(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
+        }
         else             expert_prefetch(pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
         __atomic_store_n(&pilot_r,r+1,__ATOMIC_RELEASE);
     }
@@ -2888,7 +3174,8 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
             ESlot *P=m->pin[lt];
             for(int z=0;z<m->npin[lt] && !found;z++) if(P[z].eid==best) found=1;
             ESlot *Sl=m->ecache[lt];
-            for(int z=0;z<m->ecn[lt] && !found;z++) if(Sl[z].eid==best) found=1;
+            for(int z=0;z<m->ecn[lt] && !found;z++)
+                if(Sl[z].eid==best || Sl[z].eid==-(best+2)) found=1;
             pthread_mutex_unlock(&g_pilot_mx);
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
@@ -2949,7 +3236,8 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             ESlot *P=m->pin[lnext];
             for(int z=0;z<m->npin[lnext] && !found;z++) if(P[z].eid==best) found=1;
             ESlot *Sl=m->ecache[lnext];
-            for(int z=0;z<m->ecn[lnext] && !found;z++) if(Sl[z].eid==best) found=1;
+            for(int z=0;z<m->ecn[lnext] && !found;z++)
+                if(Sl[z].eid==best || Sl[z].eid==-(best+2)) found=1;
             pthread_mutex_unlock(&g_pilot_mx);
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
@@ -4971,6 +5259,20 @@ int main(int argc, char **argv){
     g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):0;       /* default OFF: overlap expert load ‖ matmul (byte-identical; reorders I/O). PIPE=1 opts in */
     g_pipe_nw = getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8; /* I/O worker threads */
     if(g_pipe_nw<1) g_pipe_nw=1;
+    g_uring = getenv("URING")?atoi(getenv("URING")):0;
+    if(g_uring){
+#ifdef __linux__
+        if(g_mmap){ fprintf(stderr,"URING=1 is incompatible with COLI_MMAP=1\n"); return 2; }
+        g_pipe=1;
+        if(uring_batch_init(&g_ub_pipe) || (g_pilot_real&&uring_batch_init(&g_ub_pilot))){
+            fprintf(stderr,"URING=1: io_uring_setup failed: %s\n",strerror(errno)); return 2;
+        }
+        fprintf(stderr,"[URING] queued expert I/O active (depth=%d%s)\n",URING_REQ_MAX,
+                g_pilot_real?", batched PILOT_REAL":"");
+#else
+        fprintf(stderr,"URING=1 is supported only on Linux\n"); return 2;
+#endif
+    }
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){

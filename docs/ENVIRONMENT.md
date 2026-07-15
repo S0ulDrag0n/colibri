@@ -40,6 +40,7 @@ Format: `VAR` — default — effect.
 | `COLI_METAL_SPIN` | off | Keep a GPU keep-alive spinner running (reduces dispatch latency; costs power). |
 | `PIPE` | `0` (off) | Overlap expert disk-load with matmul via I/O worker threads. Byte-identical output; reorders I/O. `PIPE=1` opts in. |
 | `PIPE_WORKERS` | `8` | Number of I/O worker threads when `PIPE=1`. Tune to your SSD (fewer avoids over-subscribing cores). |
+| `URING` | `0` (off) | Linux-only queued expert I/O. `URING=1` implies `PIPE=1`, replaces blocking loader pthreads and spin waits with batched io_uring SQEs/CQEs, and batches `PILOT_REAL` loads on a separate ring. Fails clearly if the kernel denies io_uring; incompatible with `COLI_MMAP=1`. |
 | `DIRECT` | `0` (off) | Use `O_DIRECT`/unbuffered reads for expert slabs. Helps sustained NVMe; keeps the zero-copy GPU path. |
 | `COLI_NO_OMP_TUNE` | off | **Kill-switch** for the OpenMP hot-thread tuning (`OMP_WAIT_POLICY=active` spin + proc-bind). Set `=1` when the CPU is mostly waiting on the GPU (Metal) so spin doesn't steal the shared power budget. |
 | `MLOCK` | `-1` (auto: on for macOS) | Wire the streamed expert cache into physical RAM (`mlock`) to dodge the memory compressor. `0` off, `1` force. |
