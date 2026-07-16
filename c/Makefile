@@ -108,7 +108,12 @@ CUDA_DLL  ?= 0
 CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= native
-NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
+# -Xcompiler passes flags to nvcc's HOST compiler. On Windows that host is MSVC
+# cl.exe, which rejects the gcc/clang-style -Wall,-Wextra (D8021). Gate them
+# behind a non-MSVC host so the Linux/macOS (gcc/clang) build keeps the warnings
+# and the Windows cuda-dll build doesn't fail. (#306)
+NVCC_HOST_WARN ?= $(if $(IS_WIN),,-Xcompiler=-Wall,-Wextra)
+NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) $(NVCC_HOST_WARN)
 ifeq ($(IS_WIN),)
 PYTHON    ?= python3
 else
@@ -158,11 +163,25 @@ all: glm$(EXE)
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
 
-glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ)
+# Config stamp: make only tracks file timestamps, not flag changes. Without this,
+# `make glm.exe CUDA_DLL=1` after a prior CPU-only build reports "up to date" and
+# silently keeps the CPU-only binary (no CUDA loader) — a build that looks like it
+# worked but isn't. We record the build-affecting flags in .build-config and rewrite
+# it ONLY when they change (evaluated here at parse time, so the file's timestamp
+# moves exactly when the config moves). glm.exe and the CUDA/loader objects depend
+# on it, so they relink on a config change and stay put otherwise. (#306)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)
+BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
+ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
+$(shell printf '%s' '$(BUILD_CONFIG)' > .build-config)
+endif
+.build-config: ;
+
+glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) -o glm$(EXE) $(LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
-backend_loader.o: backend_loader.c backend_cuda.h compat.h
+backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 	$(CC) $(CFLAGS) -c backend_loader.c -o $@
 
 # Windows CUDA DLL: compile backend_cuda.cu with nvcc (+MSVC cl.exe as host
@@ -171,15 +190,15 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 11 API symbols are exported.
 cuda-dll: backend_cuda.cu backend_cuda.h
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
+	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
 		backend_cuda.cu -o coli_cuda.dll
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) -c backend_cuda.cu -o $@
+backend_cuda.o: backend_cuda.cu backend_cuda.h .build-config
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda.cu -o $@
 
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
@@ -189,13 +208,13 @@ metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
 	./backend_metal_test
 
 cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
 
 cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
 	./backend_cuda_bench$(EXE)
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
