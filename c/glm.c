@@ -3549,17 +3549,30 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     if(!coli_cuda_pipe_rmsnorm(dev,nrm_d,x_dev,w_post,S,D,c->eps)) return 0;
     if(!coli_cuda_pipe_download(dev,nrm_d,nrm_host,xb)) return 0;
     m->t_attn+=now_s()-ta;
-    /* expert routed su CPU/gruppi GPU come oggi (shared saltata: la fa il device) */
-    moe(m,l,li,nrm_host,S,out_host,0);
+    /* OVERLAP: issue the shared expert on the GPU BEFORE moe() runs on the CPU.
+     * The shared expert reads nrm_d (valid after the download above) and writes its
+     * residual into x_dev (async). While the GPU computes this, the CPU enters moe()
+     * for routing + expert disk loads + matmul — ~50ms of work that previously left
+     * the GPU idle. The shared expert (~0.5ms) finishes early in that window.
+     *
+     * After moe(), the routed-expert result is uploaded (sync pipe_upload) and added
+     * to x_dev (async). Both residual adds (shared + routed) are ordered on the same
+     * stream — the next layer's pipe_rmsnorm reads x_dev after both complete.
+     *
+     * No pipe_sync at the end: the next layer's pipe_download (sync cudaMemcpy)
+     * provides the implicit sync point. The fallback path (caller downloads x_dev)
+     * also uses pipe_download which syncs. This lets GPU work chain across layers
+     * without a per-layer stall. */
     double te=now_s();
-    if(!coli_cuda_pipe_upload(dev,y_d,out_host,xb)) return 0;
-    if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;
     if(!coli_cuda_pipe_gemm(l->sh_gate.cuda,sg_d,nrm_d,S)) return 0;
     if(!coli_cuda_pipe_gemm(l->sh_up.cuda,su_d,nrm_d,S)) return 0;
     if(!coli_cuda_pipe_silu_mul(dev,sg_d,su_d,(size_t)S*sI)) return 0;
     if(!coli_cuda_pipe_gemm(l->sh_down.cuda,y_d,sg_d,S)) return 0;
-    if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;
-    if(!coli_cuda_pipe_sync(dev)) return 0;
+    if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* shared residual (async) */
+    /* expert routed su CPU/gruppi GPU come oggi (shared saltata: la fa il device) */
+    moe(m,l,li,nrm_host,S,out_host,0);
+    if(!coli_cuda_pipe_upload(dev,y_d,out_host,xb)) return 0;     /* sync: waits for moe */
+    if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* routed residual (async) */
     m->t_emm+=now_s()-te;
     return 1;
 }
@@ -3656,10 +3669,20 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
 #ifdef COLI_CUDA
     /* PIPE2 (Inc.2a): il residuo resta sul device del layer, saltando tra le schede
-     * ai confini di layer. x host diventa STALE finche' la residenza e' attiva. */
+     * ai confini di layer. x host diventa STALE finche' la residenza e' attiva.
+     *
+     * S threshold is device-count-dependent (#273): on a single GPU the resident
+     * stream wins at S=1 (evicts the CPU round-trips that dominate small-batch
+     * decode — +49% on a 5070 Ti). With layers sharded across multiple GPUs each
+     * resident forward crosses P2P per layer group, and at one token per forward
+     * those hops don't amortize — A/B on 6x5090 showed S=1 is a wash there. So:
+     * single-GPU engages at S=1, multi-GPU keeps the original S>=8 prefill gate.
+     * COLI_CUDA_PIPE_S_MIN overrides for anyone who wants to measure. */
     float *x_dev=NULL; int x_dev_on=-1;
     size_t xb=(size_t)S*(size_t)D*4;
-    int pipe2 = g_cuda_pipe>=2 && !kvs && S>=8 && g_cuda_enabled && c->kv_lora<=512 &&
+    int pipe_s_min = getenv("COLI_CUDA_PIPE_S_MIN") ? atoi(getenv("COLI_CUDA_PIPE_S_MIN"))
+                                                     : (g_cuda_ndev<=1 ? 1 : 8);
+    int pipe2 = g_cuda_pipe>=2 && !kvs && S>=pipe_s_min && g_cuda_enabled && c->kv_lora<=512 &&
                 !(m->has_dsa && pos_base+S>c->index_topk);
 #endif
     for(int i=0;i<c->n_layers;i++){
@@ -4385,6 +4408,14 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         printf("LOOKAHEAD routing — recall of true experts in predicted top-8:\n");
         for(int i=0;i<4;i++) printf("  %-42s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
+    }
+    /* TOKENS=1: dump the generated token ids (newline-separated) to stderr,
+     * for exact A/B comparison across decode paths (e.g. resident vs CPU).
+     * The ids are all[np .. np+produced-1]. */
+    if(getenv("TOKENS") && atoi(getenv("TOKENS"))){
+        fprintf(stderr,"[TOKENS] %d generated:",produced);
+        for(int i=np;i<np+produced;i++) fprintf(stderr," %d",all[i]);
+        fprintf(stderr,"\n");
     }
     free(pids); free(all);
     usage_save(m);
@@ -5421,7 +5452,8 @@ static double kv_pool_bytes(Model *m, int max_ctx){
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,ebits);
     if(ram_gb<=0){ ram_gb=g_mem_avail_boot*0.88; if(ram_gb<4) ram_gb=8; }
-    double slack = 1.2e9 + 2.5e9 + 64.0*(double)eb
+    double ws_b = (g_expert_budget>0 && g_expert_budget<64) ? (double)(g_expert_budget+4)*(double)eb : 64.0*(double)eb;
+    double slack = 1.2e9 + 2.5e9 + ws_b
         + kv_pool_bytes(m,max_ctx)
         + (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
     return ram_gb*1e9 - (double)m->resident_bytes - slack;
@@ -5443,11 +5475,22 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      *  KV cache a max_ctx, kvb_all della ricostruzione k/v in attention,
      *  attivazioni+logits+overhead ~1.2 GB */
     double ws_b  = 64.0*(double)eb;
+    /* Under EXPERT_BUDGET, the block-of-64 working set is capped at budget experts
+     * per layer — only ws[0..budget-1] are populated, not all 64. The 64×eb reserve
+     * overcounts by 16x at budget=4, starving the LRU cache (cap 3 instead of 4).
+     * Cap=4 matches budget=4, eliminating LRU thrashing that causes excessive disk
+     * re-reads. Clamp ws_b to the actual budget (min 8 for non-budgeted / prefill). */
+    if(g_expert_budget>0 && g_expert_budget<64) ws_b = (double)(g_expert_budget+4) * (double)eb;
     double kv_b  = kv_pool_bytes(m,max_ctx);
     double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
-    /* RISERVA PAGE-CACHE (misurato 2026-07-06): strangolarla fa crollare le pread
-     * buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di quanto
-     * costino in banda disco persa. 2.5 GB restano SEMPRE al kernel. */
+    /* RISERVA PAGE-CACHE (misurato 2026-07-06 su Linux): strangolarla fa crollare
+     * le pread buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di
+     * quanto costino in banda disco persa. 2.5 GB restano SEMPRE al kernel.
+     * NOTE: tested removing this under Windows+DIRECT (it should be dead weight when
+     * O_DIRECT bypasses the buffer cache). Result: cap went 4->5 but RSS hit 24 GB
+     * on a 32 GB machine, causing memory pressure that DROPPED the hit rate (73%->57%)
+     * and slowed decode (1.03->0.83 tok/s). The reserve is a legitimate safety margin
+     * for OS + CUDA + file metadata, not just buffered pread throughput. Keep it. */
     double pc_b  = 2.5e9;
     double slack = 1.2e9 + pc_b + ws_b + kv_b + kvb_b;
     double avail = ram_gb*1e9 - (double)m->resident_bytes - slack;

@@ -240,3 +240,70 @@ different cache-budget model that excludes mapped-file pages — left as future 
 - [microsoft/Windows-Dev-Performance#108 — PrefetchVirtualMemory inconsistency](https://github.com/microsoft/Windows-Dev-Performance/issues/108)
 - [llama.cpp #18758 — mmap faster than O_DIRECT for MoE (Linux)](https://github.com/ggml-org/llama.cpp/discussions/18758)
 - [HN#35426679 — Why MMAP in llama.cpp hides true memory usage](https://news.ycombinator.com/item?id=35426679)
+
+---
+
+# CACHE_ROUTE: miss elimination via cache-aware routing (2026-07-15)
+
+## The breakthrough
+
+Adding `CACHE_ROUTE=1 ROUTE_J=2 ROUTE_M=12` to the optimized stack pushed
+throughput to **1.41 tok/s** (4.3× over stock) by directly reducing the
+miss rate from 27% to 17%.
+
+## How it works
+
+The engine's `CACHE_ROUTE` feature (paper: max-rank routing, arXiv 2412.00099)
+steers the MoE router to prefer experts that are already cache-resident:
+
+- `ROUTE_J=2`: keep the top-2 true router picks (always, even if uncached)
+- `ROUTE_M=12`: fill the remaining 2 of 4 slots with the highest-ranked experts
+  that are ALREADY in the LRU cache (from the top-12 candidates)
+
+This guarantees 2 of 4 expert slots per layer per token are cache hits. The
+`route_agree=94.6%` metric confirms minimal quality cost — 94.6% of cache-steered
+picks match the true top-K the router would have chosen.
+
+## Why this is the right fix for the miss problem
+
+Analysis of route traces showed GLM-5.2's routing is nearly uniform — 75 tokens
+use 237 of 256 experts per layer, with the top-4 capturing only 4.3% of selections.
+This means:
+
+- PIN (hot-expert pre-loading) is ineffective — there are no hot experts
+- PILOT_REAL prefetch can't keep up under the fast pipe2 GPU pipeline
+- A bigger cache helps marginally but can't cover 237 unique experts per layer
+- CACHE_ROUTE is the only lever that reduces misses without more RAM or faster disk
+
+## Results (pipe2 + full stack + ws_b fix, budget=4, RAM_GB=28)
+
+| metric | without CACHE_ROUTE | with CACHE_ROUTE |
+|---|---|---|
+| tok/s | 1.03 | **1.41** (+37%) |
+| hit rate | 73% | **83%** |
+| expert-disk | 12.4s | **8.5s** (−31%) |
+| decode | 31.0s | **22.7s** (−27%) |
+| route_agree | n/a | 94.6% |
+
+## Full optimization journey
+
+| step | tok/s | hit% | disk |
+|---|---|---|---|
+| stock budget=4 | 0.33 | 9% | 65.9s |
+| + disk stack | 0.63 | 72% | 21.5s |
+| + CUDA dense+attn | 0.72 | 75% | 18.4s |
+| + pipe2 GPU pipeline | 0.85 | 57% | 18.2s |
+| + ws_b cache fix | 1.03 | 73% | 12.4s |
+| **+ CACHE_ROUTE** | **1.41** | **83%** | **8.5s** |
+
+**4.3× total speedup.** Disk I/O reduced 7.7× (65.9s → 8.5s).
+
+## Recommended config
+
+```
+EXPERT_BUDGET=4 PIPE=1 RAM_GB=28 PILOT_REAL=1 DIRECT=1
+COLI_CUDA=1 CUDA_DENSE=1 COLI_CUDA_ATTN=1 COLI_CUDA_PIPE=2 CUDA_EXPERT_GB=0
+CACHE_ROUTE=1 ROUTE_J=2 ROUTE_M=12
+```
+
+CACHE_ROUTE is an existing engine feature (no code change) — opt-in via env vars.
