@@ -115,6 +115,7 @@ print("tf_pred:", tf_pred)
 sd = model.state_dict()
 unfuse_experts(sd)
 
+Path("glm_tiny").mkdir(parents=True, exist_ok=True)   # safetensors/json won't create the dir themselves
 if args.fp8:
     n_fp8, n_tot = save_fp8_safetensors(sd, "glm_tiny/model.safetensors")
     print(f"\nsaved FP8: {n_fp8} e4m3 tensors (+{n_tot - n_fp8} scale_inv sidecars / f32) "
