@@ -94,7 +94,8 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch(ColiCudaTensor *kv_b,C
                                       int V,int K,int T,float attention_scale);
 
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_ragged(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
-        float *out,const float *q,const float *const *latent,const float *const *rope,
+        float *out,const float *q,const void *const *keys,
+        const float *const *latent,const float *const *rope,
         const int *lengths,int S,int H,int Q,int R,int V,int K,int max_t,float attention_scale);
 
 COLI_CUDA_DLLEXPORT void coli_cuda_tensor_free(ColiCudaTensor *tensor);

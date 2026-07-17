@@ -16,14 +16,18 @@ int main(){
        !coli_cuda_tensor_upload(&tp,p.data(),nullptr,0,D,O,dev))return 1;
     int n[S]={1,2,3};std::vector<std::vector<float>> l(S),r(S);
     const float *lp[S],*rp[S];
+    const void *keys[S];
     for(int s=0;s<S;s++){
         l[s].resize(n[s]*K);r[s].resize(n[s]*R);
         for(size_t i=0;i<l[s].size();i++)l[s][i]=((int)((i+s*3)%9)-4)*.08f;
         for(size_t i=0;i<r[s].size();i++)r[s][i]=((int)((i+s)%5)-2)*.06f;
-        lp[s]=l[s].data();rp[s]=r[s].data();
+        lp[s]=l[s].data();rp[s]=r[s].data();keys[s]=&l[s];
     }
-    float got[S*O],ref[S*O];
-    if(!coli_cuda_attention_project_ragged(tw,tp,got,q.data(),lp,rp,n,S,H,Q,R,V,K,T,.2f))return 2;
+    float got[S*O],ref[S*O],warm[S*O];
+    int first[S]={1,1,1};
+    if(!coli_cuda_attention_project_ragged(tw,tp,warm,q.data(),keys,lp,rp,first,
+        S,H,Q,R,V,K,1,.2f))return 2;
+    if(!coli_cuda_attention_project_ragged(tw,tp,got,q.data(),keys,lp,rp,n,S,H,Q,R,V,K,T,.2f))return 2;
     for(int s=0;s<S;s++)if(!coli_cuda_attention_project_batch(tw,tp,ref+s*O,
         q.data()+s*H*(Q+R),lp[s],rp[s],1,H,Q,R,V,K,n[s],.2f))return 3;
     double e=0,z=0;for(int i=0;i<S*O;i++){

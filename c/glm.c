@@ -2717,18 +2717,20 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
            !dnsel&&l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
            qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o)){
             const float **rl=malloc((size_t)S*sizeof(*rl)),**rr=malloc((size_t)S*sizeof(*rr));
+            const void **rk=malloc((size_t)S*sizeof(*rk));
             int *rn=malloc((size_t)S*sizeof(*rn)); int mt=0;
-            if(rl&&rr&&rn){
+            if(rk&&rl&&rr&&rn){
                 for(int s=0;s<S;s++){
                     int pos=positions[s],st0=kvs[s]->kv_start[layer]; rn[s]=pos+1-st0;
+                    rk[s]=kvs[s];
                     rl[s]=coli_kv_row(kvs[s]->Lc[layer],st0,kvl);
                     rr[s]=coli_kv_row(kvs[s]->Rc[layer],st0,c->qk_rope);
                     if(rn[s]>mt)mt=rn[s];
                 }
                 cuda_core=cuda_projected=coli_cuda_attention_project_ragged(l->kv_b.cuda,l->o.cuda,
-                    out,Q,rl,rr,rn,S,H,c->qk_nope,c->qk_rope,vh,kvl,mt,c->attn_scale);
+                    out,Q,rk,rl,rr,rn,S,H,c->qk_nope,c->qk_rope,vh,kvl,mt,c->attn_scale);
             }
-            free(rl);free(rr);free(rn);
+            free(rk);free(rl);free(rr);free(rn);
         } else if(cuda_absorb&&l->n_kv_b_shard>1){
             int n=l->n_kv_b_shard,st0=m->kv_start[layer],nt=pos_base+S-st0,ok=1;
             float *qs=falloc((int64_t)S*H*qh),*cs=falloc((int64_t)S*H*vh);
@@ -5267,7 +5269,7 @@ static void run_serve_mux(Model *m, const char *snap){
     g_draft=0; /* one scheduler owns every forward; MTP/speculation is not ragged-safe */
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
-    if(nctx<1||nctx>16){fprintf(stderr,"KV_SLOTS deve essere tra 1 e 16\n");exit(2);}
+    if(nctx<1||nctx>512){fprintf(stderr,"KV_SLOTS must be between 1 and 512\n");exit(2);}
     g_kvsave=getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
     KVState *initial=m->kv; free(initial->kv_start); free(initial);
     ServeCtx *ctx=calloc(nctx,sizeof(*ctx)); ServeReq *req=calloc(nctx,sizeof(*req));
@@ -5323,7 +5325,7 @@ static void run_serve_mux(Model *m, const char *snap){
         }
         active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         if(!active){ if(eof) break; continue; }
-        DecodeRow rows[16]; int slots[16], S=0;
+        DecodeRow rows[512]; int slots[512], S=0;
         for(int i=0;i<nctx;i++) if(req[i].active){
             rows[S]=(DecodeRow){&ctx[i].kv,req[i].pending,ctx[i].len}; slots[S++]=i;
         }
@@ -6330,8 +6332,9 @@ int main(int argc, char **argv){
     int cap  = argc>1?atoi(argv[1]):64;
     int ebits= argc>2?atoi(argv[2]):8;
     int dbits= argc>3?atoi(argv[3]):ebits;
-    if(getenv("SERVE") && (kv_slot_count()<1 || kv_slot_count()>16)){
-        fprintf(stderr,"KV_SLOTS must be between 1 and 16\n"); return 2;
+    int kv_limit=(getenv("SERVE_BATCH")&&atoi(getenv("SERVE_BATCH")))?512:16;
+    if(getenv("SERVE") && (kv_slot_count()<1 || kv_slot_count()>kv_limit)){
+        fprintf(stderr,"KV_SLOTS must be between 1 and %d\n",kv_limit); return 2;
     }
 #ifdef COLI_CUDA
     if(getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))){

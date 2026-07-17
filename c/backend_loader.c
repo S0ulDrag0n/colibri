@@ -62,7 +62,8 @@ typedef int (*fn_attention_absorb_batch_dev)(ColiCudaTensor *kv_b_shard,float *c
 typedef int (*fn_attention_absorb_kvdev)(ColiCudaTensor *kv_b,float *ctx,const float *q, const float *latent_dev,const float *rope_dev,int H,int Q,int R,int V,int K,int T, float scale);
 typedef int (*fn_attention_project_batch)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q,const float *latent, const float *rope,int S,int H,int Q,int R, int V,int K,int T,float attention_scale);
 typedef int (*fn_attention_project_ragged)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
-        float *out,const float *q,const float *const *latent,const float *const *rope,
+        float *out,const float *q,const void *const *keys,
+        const float *const *latent,const float *const *rope,
         const int *lengths,int S,int H,int Q,int R,int V,int K,int max_t,float attention_scale);
 typedef int (*fn_attention_project_batch_dev)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
 typedef int (*fn_attention_project_batch_dev_out)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
@@ -348,10 +349,11 @@ int coli_cuda_attention_project_batch(ColiCudaTensor *kv_b,ColiCudaTensor *o_pro
 }
 
 int coli_cuda_attention_project_ragged(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
-        float *out,const float *q,const float *const *latent,const float *const *rope,
+        float *out,const float *q,const void *const *keys,
+        const float *const *latent,const float *const *rope,
         const int *lengths,int S,int H,int Q,int R,int V,int K,int max_t,float attention_scale){
     if(!coli_cuda_load()) return 0;
-    return g_cuda.attention_project_ragged(kv_b,o_proj,out,q,latent,rope,lengths,
+    return g_cuda.attention_project_ragged(kv_b,o_proj,out,q,keys,latent,rope,lengths,
         S,H,Q,R,V,K,max_t,attention_scale);
 }
 
