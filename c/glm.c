@@ -2284,6 +2284,18 @@ static void expert_prefetch(Model *m, int layer, int eid){
 static void qt_addrow(const QT *t, int row, float coef, float *acc){
     int I=t->I;
     if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=coef*w[i]; return; }
+    /* fmt=4 PRIMA del calcolo di c: s[] e' [O,ng] per-gruppo, s[row] sarebbe la scala
+     * sbagliata. Senza questo ramo il fall-through int2 decodificava i nibble int4 come
+     * coppie di valori a 2 bit — lo stesso bug di #298 sui kernel absorb CUDA, lato CPU.
+     * EN: fmt=4 BEFORE computing c: s[] is [O,ng] per-group, s[row] would be the wrong
+     * scale. Without this branch the int2 fall-through decoded int4 nibbles as pairs of
+     * 2-bit values — the same bug #298 fixed in the CUDA absorb kernels, CPU side. */
+    if(t->fmt==4){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
+        int gs=t->gs, ng=(I+gs-1)/gs; const float *scl=t->s+(int64_t)row*ng;
+        for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1];
+            acc[i]  +=coef*scl[i/gs]    *((int)(b&0xF)-8);
+            acc[i+1]+=coef*scl[(i+1)/gs]*((int)(b>>4)-8); }
+        if(I&1){ uint8_t b=w[I>>1]; acc[I-1]+=coef*scl[(I-1)/gs]*((int)(b&0xF)-8); } return; }
     float c=coef*t->s[row];
     if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=c*(float)w[i]; return; }
     if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
@@ -2302,6 +2314,13 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
         else if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); float s=t->s[row]; float acc=0;
             for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
             if(I&1){ uint8_t b=w[I>>1]; acc+=((int)(b&0xF)-8)*x[I-1]; } a=acc*s; }
+        else if(t->fmt==4){ /* per-gruppo, come matmul_i4_grouped / per-group, as matmul_i4_grouped */
+            const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
+            int gs=t->gs, ng=(I+gs-1)/gs; const float *scl=t->s+(int64_t)row*ng;
+            for(int g=0; g*gs<I; g++){ int base=g*gs, end=base+gs>I?I:base+gs; float acc=0;
+                for(int i=base;i<end;i++){ uint8_t b=w[i>>1];
+                    acc+=(float)((i&1)?((int)(b>>4)-8):((int)(b&0xF)-8))*x[i]; }
+                a+=(double)acc*scl[g]; } }
         else { const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
             for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=acc*s; }
         y[j]=(float)a;
