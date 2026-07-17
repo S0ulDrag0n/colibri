@@ -59,6 +59,12 @@ static double bench_ns(void (*fn)(const float*,int,int,int*,int*),
     return ts[N_REPEAT/2];
 }
 
+/* Sort an array of doubles ascending (median-of-medians aggregation below). */
+static void dsort(double *a, int n){
+    for(int s=1;s<n;s++){ double k=a[s]; int b=s-1;
+        while(b>=0 && a[b]>k){ a[b+1]=a[b]; b--; } a[b+1]=k; }
+}
+
 /* the NEW algorithm calls the real partial_select_desc + replicates the production
  * threshold derivation and position scans. */
 static void keep_new(const float *isc, int nk, int keep, int *dst, int *nd_out){
@@ -74,6 +80,7 @@ static void keep_new(const float *isc, int nk, int keep, int *dst, int *nd_out){
 
 /* deterministic score fill for three shapes */
 static uint32_t brng = 0xA5A5A5A5u;
+static void brng_seed(uint32_t s){ brng = s; }
 static double brand(void){ brng ^= brng << 13; brng ^= brng >> 17; brng ^= brng << 5;
     return (double)(brng >> 8) * (1.0 / 16777216.0); }
 static void fill_realistic(float *isc, int nk){   /* few hot, long distinct tail */
@@ -87,11 +94,24 @@ static void fill_plateau(float *isc, int nk){     /* tie blocks -> boundary path
     for(int i=0;i<nk;i++) isc[i]=(float)(-(double)(i/7));
 }
 
+/* Multi-seed aggregation. Per @KingIcyCreamProjects (#357 thread): with a single frozen
+ * input per cell, quickselect's deterministic median-of-three pivot means one lucky input
+ * can spike a single nk row (an observed ~75x at nk=8192 on a 9950X3D that was really a
+ * ~13-40x algorithm). Two bugs compounded it: (1) the old bench drew ONE input per cell;
+ * (2) brng was never reset, so each cell's input depended on every prior cell's draws --
+ * reordering nks[] silently shifted all later inputs. Both fixed here: brng is reseeded
+ * per (shape, nk, seed), and we take the MEDIAN of N_SEEDS independent inputs, each itself
+ * a median over N_REPEAT timing reps. A lucky pivot now moves one of the N_SEEDS samples,
+ * not the reported number. */
+
 int main(void){
     int keep = 2048;   /* GLM-5.2 index_topk */
     int nks[] = {2049, 4096, 8192, 16384, 32768, 65536};
+    const int N_SEEDS = 11;   /* odd so the median is a real sample, not interpolated */
     float *isc = malloc((size_t)65536*sizeof(float));
     int *dst   = malloc((size_t)65536*sizeof(int)); int nd;
+    double *old_seeds = malloc((size_t)N_SEEDS*sizeof(double));
+    double *new_seeds = malloc((size_t)N_SEEDS*sizeof(double));
 
     struct { const char *name; void (*fill)(float*,int); } shapes[] = {
         { "realistic", fill_realistic },
@@ -99,27 +119,40 @@ int main(void){
         { "plateau",   fill_plateau   },
     };
 
-    printf("bench_dsa_select: DSA top-keep, old (qsort) vs new (partial-select)  keep=%d\n", keep);
+    printf("bench_dsa_select: DSA top-keep, old (qsort) vs new (partial-select)  keep=%d  (median of %d seeds x %d reps)\n",
+           keep, N_SEEDS, N_REPEAT);
     printf("%-12s %7s %14s %14s %9s\n", "shape", "nk", "old ns/call", "new ns/call", "speedup");
     printf("------------------------------------------------------------------------\n");
 
     for(size_t sh=0; sh<sizeof(shapes)/sizeof(shapes[0]); sh++){
         for(size_t ni=0; ni<sizeof(nks)/sizeof(nks[0]); ni++){
             int nk=nks[ni];
-            shapes[sh].fill(isc,nk);
-            /* warmup both paths so caches/branch predictors are primed */
-            for(int w=0; w<50; w++){ keep_old(isc,nk,keep,dst,&nd); keep_new(isc,nk,keep,dst,&nd); }
-            /* sanity: both must keep exactly `keep` (correctness is test_dsa_select's
-             * job, but a count divergence here would make the timing meaningless) */
-            keep_old(isc,nk,keep,dst,&nd); int na=nd;
-            keep_new(isc,nk,keep,dst,&nd); int nb=nd;
-            if(na!=keep || nb!=keep){
-                printf("%-12s %7d   (BAD COUNTS: old=%d new=%d, skipped)\n",
-                       shapes[sh].name, nk, na, nb);
+            int bad = 0;
+            for(int sd=0; sd<N_SEEDS; sd++){
+                /* reseed per (shape,nk,seed) so each cell's input is reproducible and
+                 * independent of cell ordering, and so lucky pivots are sampled, not fixed. */
+                brng_seed(0xA5A5A5A5u + (uint32_t)(sd*0x9E3779B9u));
+                shapes[sh].fill(isc,nk);
+                /* warmup both paths so caches/branch predictors are primed */
+                for(int w=0; w<50; w++){ keep_old(isc,nk,keep,dst,&nd); keep_new(isc,nk,keep,dst,&nd); }
+                /* sanity: both must keep exactly `keep` (correctness is test_dsa_select's
+                 * job, but a count divergence here would make the timing meaningless) */
+                keep_old(isc,nk,keep,dst,&nd); int na=nd;
+                keep_new(isc,nk,keep,dst,&nd); int nb=nd;
+                if(na!=keep || nb!=keep){ bad++; continue; }
+                old_seeds[sd] = bench_ns(keep_old,isc,nk,keep);
+                new_seeds[sd] = bench_ns(keep_new,isc,nk,keep);
+            }
+            if(bad == N_SEEDS){
+                printf("%-12s %7d   (BAD COUNTS on all %d seeds, skipped)\n",
+                       shapes[sh].name, nk, bad);
                 continue;
             }
-            double t_old=bench_ns(keep_old,isc,nk,keep);
-            double t_new=bench_ns(keep_new,isc,nk,keep);
+            /* report median-of-seed-medians: robust to a single lucky/unlucky pivot */
+            dsort(old_seeds, N_SEEDS);
+            dsort(new_seeds, N_SEEDS);
+            double t_old = old_seeds[N_SEEDS/2];
+            double t_new = new_seeds[N_SEEDS/2];
             printf("%-12s %7d %14.0f %14.0f %8.2fx\n",
                    shapes[sh].name, nk, t_old, t_new, t_old/t_new);
         }
@@ -127,6 +160,6 @@ int main(void){
     }
 
     printf("bench_dsa_select: done (lower ns is better; speedup = old/new)\n");
-    free(isc); free(dst);
+    free(isc); free(dst); free(old_seeds); free(new_seeds);
     return 0;
 }
