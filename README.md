@@ -3,6 +3,12 @@
 </p>
 
 <p align="center">
+  <a href="https://justvugg.github.io/colibri"><img src="https://img.shields.io/badge/website-justvugg.github.io%2Fcolibri-1f6feb" alt="Website"></a>
+  <a href="https://github.com/JustVugg/colibri/releases"><img src="https://img.shields.io/github/v/release/JustVugg/colibri?color=2ea043" alt="Latest release"></a>
+</p>
+
+<p align="center">
+  <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
   English · <a href="README.zh-TW.md">繁體中文</a>
 </p>
 
