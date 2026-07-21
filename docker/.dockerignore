@@ -1,0 +1,24 @@
+# Build context for the colibri Docker images.
+#
+# The Dockerfile lives at docker/Dockerfile, but its build CONTEXT is the
+# repo root (so the COPY c/ /opt/colibri/c/ instruction resolves). Without
+# this file, `docker build` would walk the entire working tree and tarball
+# ~370 GB worth of safetensors shards, the .git directory, the web/node_modules,
+# the desktop/target, etc. — every one of which is dead weight at build time.
+#
+# Strategy: deny everything, then allow exactly what the Dockerfiles need.
+#   - c/                     — the engine source, Makefile, and Python CLI
+#   - docker/                — healthcheck.py and (for the .cuda image) any
+#                              cross-stage artifacts we copy in
+#
+# Everything else (models, .git, web/node_modules, desktop/target, docs
+# PDF renders, *.pyc, .DS_Store) is excluded by the leading `*` rule.
+
+# Deny everything
+*
+# Allow the engine directory and everything in it
+!c/
+!c/**
+# Allow the docker directory itself (needed if a future stage COPYs from it)
+!docker/
+!docker/**

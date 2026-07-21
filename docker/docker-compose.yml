@@ -1,0 +1,203 @@
+# colibrì — Docker Compose definition.
+#
+# Two services, one image each:
+#   - coli        : the CPU runtime (default profile, built from Dockerfile)
+#   - coli-gpu    : the CUDA runtime (gpu profile, built from Dockerfile.cuda)
+#
+# Usage:
+#   make build         # builds the CPU image (colibri:1.0)
+#   make up            # starts the CPU service in the background
+#   make build-gpu     # builds the CUDA image (colibri:1.0-cuda)
+#   make up-gpu        # starts the CUDA service (requires NVIDIA Container Toolkit)
+#
+# Or directly with docker compose:
+#   docker compose --profile gpu up -d coli-gpu
+#
+# BEFORE YOU START, edit the line marked EDIT THIS below so the
+# bind-mount points at the int4 model directory on your host. The
+# colibri engine mmaps every shard at startup and reads ~11 GB of
+# expert bytes per cold token, so this directory MUST be on a local
+# ext4/xfs/btrfs filesystem — never on NFS, 9p, or virtiofs (Docker
+# Desktop's bind-mount on macOS/Windows uses virtiofs and is
+# catastrophic for this workload). See docker/README.md for details.
+#
+# The container's COLI_MODEL env is /models/glm52_i4 (matches the
+# Dockerfile). Anything you mount there is what the engine sees.
+
+name: colibri
+
+services:
+  # ----------------------------------------------------------------
+  # CPU service. Default profile. Use `make up` or `docker compose up`.
+  # ----------------------------------------------------------------
+  coli:
+    profiles: ["default"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        # native = fastest on the build host; x86-64-v3 = portable
+        # binary you can copy to other machines.
+        ARCH: ${ARCH:-native}
+    image: colibri:1.0
+    container_name: colibri
+
+    # `init: true` injects a tiny PID-1 that reaps zombies and (critically)
+    # forwards SIGINT/SIGTERM correctly. Without it, `docker stop` sends
+    # SIGKILL after 10 seconds, which kills the engine mid-load. With it,
+    # the engine's own SIGINT handler (c/coli:760 — `signal.signal(SIGINT,
+    # default_int_handler)`) runs, and the chat loop's outer except (c/coli:613)
+    # cleanly closes the current turn before shutdown.
+    init: true
+
+    # ulimit nofile MUST be 65536+. The engine mmaps 144+ safetensors
+    # shards at startup (c/coli:28 raises RLIMIT_NOFILE in the parent
+    # Python process, but cgroups clip the inherited value). Setting
+    # this here is the canonical fix.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    environment:
+      # Auto-download from Hugging Face on first start. See plans/hf-auto-download.md.
+      COLI_HF_REPO: "${COLI_HF_REPO:-}"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      COLI_HF_REVISION: "${COLI_HF_REVISION:-}"
+      COLI_HF_WORKERS: "${COLI_HF_WORKERS:-8}"
+      COLI_HF_EXPECT_GB: "${COLI_HF_EXPECT_GB:-450}"
+
+
+    # cpuset: pin to PHYSICAL cores only. SMT siblings share execution
+    # units that the engine's memory-bound quantized kernels already
+    # saturate, and OpenMP threads scheduled on a hyperthread's
+    # "sibling" of a busy physical core will stall. Use `lscpu | grep
+    # '^Core(s)'` to find the count. Example for a 12-core CPU with
+    # hyperthreading (24 logical processors): cpuset: "0-11".
+    # cpuset: "0-11"
+
+    # mem_limit is the engine's view of "MemAvailable" — it sizes the
+    # expert cache to 88% of this number. Set this to the amount of RAM
+    # you want the engine to USE, not the total host RAM. If your host
+    # has 64 GB but you want the engine to stay at 30 GB (leaving head-
+    # room for the page cache, .coli_kv, etc.), set 30g.
+    mem_limit: 30g
+
+    # Bind-mount the int4 model directory from the host. EDIT THIS.
+    # Recommended: point at a directory on a local NVMe/ext4 filesystem.
+    # The colon at the end is critical — it's the in-container mount
+    # point and must match the COLI_MODEL env below.
+    volumes:
+      - ${MODEL_DIR:-./models}:/models/glm52_i4:rw
+      - coli_state:/root/.local/share/colibri
+    ports:
+      - "8000:8000"
+
+    # The healthcheck is wired here (not in the Dockerfile) so the URL,
+    # timeout, and start_period can be tuned in one place. start_period
+    # covers the model load window (~30-90s on first launch).
+    healthcheck:
+      test: ["CMD", "python3", "/opt/colibri/docker/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+    # The CLI subcommands run as the CMD. Override at run time with
+    # `docker compose run coli chat`, `info`, `plan`, `doctor`, etc.
+    # Default in the Dockerfile: `coli serve --host 0.0.0.0 --port 8000`.
+
+    # Restart policy: only restart on hard failure, not on clean exits
+    # (which usually mean the model failed to load and we want the user
+    # to see the error in `docker compose logs`).
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------
+  # GPU service. Opt-in. Use `make up-gpu` or
+  #   docker compose --profile gpu up -d coli-gpu
+  # Requires:
+  #   - NVIDIA driver (host)
+  #   - NVIDIA Container Toolkit (host)
+  #   - nvidia-container-runtime configured as the default runtime,
+  #     OR a Compose v2 build that supports the `deploy.resources`
+  #     syntax for GPU devices (Compose v2.20+).
+  # ----------------------------------------------------------------
+  coli-gpu:
+    profiles: ["gpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cuda
+      args:
+        ARCH: ${ARCH:-native}
+    image: colibri:1.0-cuda
+    container_name: colibri-gpu
+
+    init: true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    # cpuset: same as the CPU service. Even with a GPU tier, the
+    # CPU kernels handle attention/embedding/most of the routed experts;
+    # pinning to physical cores is still important.
+    # cpuset: "0-11"
+    mem_limit: 30g
+
+    volumes:
+      - ${MODEL_DIR:-./models}:/models/glm52_i4:rw
+      - coli_state:/root/.local/share/colibri
+
+    ports:
+      - "8000:8000"
+
+    # Environment wiring for the GPU tier. The Dockerfile does NOT bake
+    # COLI_CUDA=1 in, so this env block is what activates the GPU path.
+    # CUDA_EXPERT_GB=auto tells the engine to fill each selected device
+    # up to free VRAM minus projected dense tensors and 2 GB of runtime
+    # headroom (see c/resource_plan.py).
+    environment:
+      COLI_CUDA: "1"
+      # Auto-download from Hugging Face on first start. Set COLI_HF_REPO to
+      # a model repo id (e.g. cpatonn/GLM-5.2-Colibri-int4) and the
+      # entrypoint will populate COLI_MODEL before launching the engine.
+      # Unset by default — bind-mount a pre-populated model dir instead.
+      # See plans/hf-auto-download.md and docker/hf_fetch.py.
+      COLI_HF_REPO: "${COLI_HF_REPO:-}"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      COLI_HF_REVISION: "${COLI_HF_REVISION:-}"
+      COLI_HF_WORKERS: "${COLI_HF_WORKERS:-8}"
+      # Free-space check (GB) before the download. 450 fits the int4
+      # model (~372 GB) with 20% headroom; bump to 820 for the FP8 model.
+      COLI_HF_EXPECT_GB: "${COLI_HF_EXPECT_GB:-450}"
+      CUDA_EXPERT_GB: "${CUDA_EXPERT_GB:-auto}"
+      # Optional: pin specific devices by index. Default = all visible.
+      # COLI_GPUS: "0,1,2,3,4,5"
+
+    # The `deploy` block is the Compose v2 way to request GPU access.
+    # Requires `nvidia` as the default runtime or the
+    # nvidia-container-runtime-hook on the host.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${NVIDIA_VISIBLE_DEVICES:-all}
+              capabilities: [gpu]
+
+    healthcheck:
+      test: ["CMD", "python3", "/opt/colibri/docker/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+    restart: unless-stopped
+
+# Named volume for engine state (.coli_kv, .coli_usage). This survives
+# `docker compose down` (use `docker compose down -v` to wipe).
+# The in-container path matches what c/coli writes next to the model
+# when COLI_MODEL_STATE_DIR is not set; we override the default here
+# so state lives in Docker's volume area instead of the model dir.
+volumes:
+  coli_state:
+    name: colibri_state

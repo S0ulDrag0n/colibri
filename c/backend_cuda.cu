@@ -7,6 +7,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#ifdef __linux__
+#include <sys/mman.h>  /* 1g: MADV_DONTNEED on pinned H2D staging (3090) */
+#endif
 
 struct RaggedKVEntry {
     const void *key;
@@ -671,9 +674,28 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     cudaError_t copy_x=async?cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream)
                             :cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice);
     if(!cuda_ok(copy_x,"expert group input upload")) return 0;
+    /* 1g: MADV_DONTNEED on host_x after the H2D completes.
+     * 600 H2Ds/token x 256 KB = 150 MB/token of pinned page-cache pressure;
+     * on 3090 (PCIe Gen3) the page cache fights the expert cache. On 5090
+     * (PCIe Gen5) this is amortized by the larger H2D bandwidth. Default
+     * ON; opt out via COLI_CUDA_H2D_DONTNEED=0. Gated by __linux__. */
+    if(async && (!getenv("COLI_CUDA_H2D_DONTNEED") || atoi(getenv("COLI_CUDA_H2D_DONTNEED")))){
+#ifdef __linux__
+        cudaEvent_t h2d_done; cudaEventCreateWithFlags(&h2d_done, cudaEventDisableTiming);
+        cudaEventRecord(h2d_done, ctx->stream);
+        cudaEventSynchronize(h2d_done);  /* cheap: fires when H2D is done */
+        cudaEventDestroy(h2d_done);
+        (void)madvise(ctx->host_x, ctx->host_x_cap, MADV_DONTNEED);
+#endif
+    }
     if(profile) cudaEventRecord(ev[1],ctx->stream);
     GroupDesc *dev=(GroupDesc*)ctx->group_desc;
-    int tc=getenv("COLI_CUDA_TC_INT4")&&atoi(getenv("COLI_CUDA_TC_INT4"));
+    /* 1a: TC_INT4 default for Ampere+ (sm_86+). The wmma s4 8x8x32 path is
+     * fully SASS-supported on compute_major>=8. On compute_major<8 it falls
+     * back to the dense W4 path. COLI_CUDA_TC_INT4 env override still wins. */
+    int tc_default = (ctx->compute_major >= 8) ? 1 : 0;
+    const char *tc_env = getenv("COLI_CUDA_TC_INT4");
+    int tc = tc_env ? atoi(tc_env) : tc_default;
     tc=tc&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;

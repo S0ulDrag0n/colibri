@@ -3141,7 +3141,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     /* PIPE Inc.1b: il batch-union del prefill passa dai gruppi GPU — prima di
      * questo, 9343 expert in VRAM restavano INUTILIZZATI durante il prefill
      * (misurato: 81s di expert-matmul tutto su CPU, GPU groups 21ms totali). */
-    int group_enabled = S<=64 || (g_cuda_pipe && S<=4096);
+    /* 6d: S>=g_cuda_group_s_min gate. Below this S the group path is
+     * pure overhead (small launch + tiny tile fills) on Ampere and Ada.
+     * Opt-in via COLI_CUDA_GROUP_S_MIN=N; default 8 (matches the per-
+     * group minimum that grouped_s4_wmma tile-mask requires anyway). */
+    static int s_cuda_group_s_min = -1;
+    if(s_cuda_group_s_min<0){
+        const char *e=getenv("COLI_CUDA_GROUP_S_MIN");
+        s_cuda_group_s_min = e ? atoi(e) : 8;
+    }
+    int group_enabled = (s_cuda_group_s_min>0 && S>=s_cuda_group_s_min)
+                      && (S<=64 || (g_cuda_pipe && S<=4096));
     float *group_x=group_enabled?falloc((int64_t)S*K*D):NULL;
     float *group_y=group_enabled?falloc((int64_t)S*K*D):NULL;
     int *group_row=group_enabled?malloc((size_t)64*S*sizeof(int)):NULL;

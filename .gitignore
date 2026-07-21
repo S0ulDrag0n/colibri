@@ -68,3 +68,20 @@ c/tests/test_decode_batch
 c/tests/test_i4_acc512
 c/tests/test_idot
 c/tests/test_uring
+
+# file di scratch / artefatti di sessione (non parte del motore)
+COMMIT_EDITMSG
+scratch_replace.out
+scratch_*.py
+scratch_*.out
+docker/build.log
+docker/build-cuda.log
+docker/.fix_volumes.py
+docker/.crlf_to_lf.py
+docker/.patch_*.py
+c/.apply_*.py
+c/*.bak*
+c/.bak*
+docker/.dockerignore.bak
+docker/Dockerfile.bak
+docker/Dockerfile.cuda.bak

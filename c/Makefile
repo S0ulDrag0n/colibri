@@ -143,6 +143,14 @@ else
 CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
 endif
+# 3b: CUDA_ARCH defaults. The Makefile defaults to `native` which is fine, but the
+# wmma::experimental::precision::s4 8x8x32 path is SASS-supported from CUDA 12.4
+# and the s4 SASS was incomplete before that. Recommended explicit values:
+#   sm_86  -- GeForce RTX 3090 (Ampere GA102)
+#   sm_89  -- GeForce RTX 4080/4090 (Ada GA10x)
+#   sm_90  -- H100 / professional Hopper
+#   sm_120 -- GeForce RTX 5090 (Blackwell GB202)
+# Pass: make CUDA=1 CUDA_ARCH=sm_86 ...  (or whatever your card needs)
 CUDA_ARCH ?= native
 ifneq ($(IS_WIN),)
 # nvcc's host compiler on Windows is MSVC cl.exe: the GCC-style
@@ -150,9 +158,16 @@ ifneq ($(IS_WIN),)
 # '/Wextra'"), which made `make cuda-dll` unbuildable as shipped. -W3 is
 # the MSVC warning level (dash form, NOT /W3: MSYS make would mangle the
 # slash-form into a filesystem path).
+# 3a: CUDA_FAST=1 adds ptxas-level -O3 and -dlcm=ca (cache global loads in L1).
+# -dlcm=ca is the right call for the int4 weight reads (every byte is read 8+ times
+# per forward). -use_fast_math changes rounding -- DO NOT enable with MTP because the
+# int8 MTP head is greedy-sensitive (see plan decision #5). Default: unchanged.
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-W3
 else
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
+endif
+ifdef CUDA_FAST
+NVCCFLAGS += -Xptxas -O3 -dlcm=ca
 endif
 # PYTHON is a HOST tool (clean/test-c/test-python run it on the build machine),
 # so key it off the host, NOT $(IS_WIN) — which is derived from the *target*
@@ -359,6 +374,29 @@ test-c: $(TEST_BINS)
 
 test-python:
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
+
+# A/B harness for the CUDA + SSD streaming plan (item 1 of
+# plans/cuda-and-ssd-optimization.md). Opt-in: requires a
+# tools/make_glm_bench_model.py fixture on disk and the engine built
+# with CUDA=1. Skips with code 77 (the same convention the engine
+# uses for "no CUDA device") so `make check` keeps working on hosts
+# without a GPU or a fixture.
+#
+#	GLM_BENCH_MODEL=/path/to/glm_bench_i4 make cuda-disk-replay
+#	GLM_BENCH_MODEL=/path/to/glm_bench_i4 CUDA=1 make cuda-disk-replay
+#
+# Output is `cuda_disk_replay.csv` in the working directory; the CSV is
+# the per-PR diff target (rows are runs, columns are the profile).
+.PHONY: cuda-disk-replay
+cuda-disk-replay: glm$(EXE)
+	@if [ -z "$(GLM_BENCH_MODEL)" ] || [ ! -d "$(GLM_BENCH_MODEL)" ]; then \
+		echo "cuda-disk-replay: skipped (set GLM_BENCH_MODEL=/path/to/fixture to run)" >&2; \
+		exit 77; \
+	fi
+	$(PYTHON) tools/cuda_disk_replay.py --model $(GLM_BENCH_MODEL) --engine ./glm$(EXE) \
+		--gpu $(or $(GPU),0) --runs $(or $(REPLAY_RUNS),3) \
+		--threads $(or $(OMP_NUM_THREADS),$(shell nproc 2>/dev/null || echo 1)) \
+		--csv $(or $(REPLAY_CSV),cuda_disk_replay.csv)
 
 test: test-c test-python
 

@@ -1,0 +1,129 @@
+# colibrì — CUDA-enabled runtime image.
+#
+# Build context: the repo root (so `COPY c/ /opt/colibri/c/` resolves).
+#
+# Build:
+#   docker build -f docker/Dockerfile.cuda -t colibri:1.0-cuda .
+# or via the Makefile in docker/:
+#   make -C docker build-gpu
+#
+# Requires on the host:
+#   - NVIDIA driver (any recent version that matches the CUDA toolkit below)
+#   - NVIDIA Container Toolkit (nvidia-docker2 / nvidia-container-runtime)
+#   - Compose v2 with `deploy.resources.reservations.devices` support
+#
+# Image architecture:
+#   1. The nvidia/cuda:*-devel base is multi-GB because it ships the CUDA
+#      toolkit, headers, and the MSVC-compatible nvcc.
+#   2. We use the same base to BUILD the engine (nvcc compiles backend_cuda.cu,
+#      gcc compiles everything else) — the Makefile's CUDA=1 path links
+#      libcudart directly into the binary.
+#   3. The runtime stage keeps just libcudart (and libstdc++) plus the
+#      engine artifacts. The full toolkit is NOT carried into the final
+#      image; we'd save ~3 GB otherwise.
+#
+# Override ARCH the same way as docker/Dockerfile.
+
+# ---------- build stage: nvcc + gcc + libcudart headers ----------
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# gcc, make, libc headers, AND the CUDA toolkit (which the base image
+# already provides under /usr/local/cuda). We add libgomp1-dev because
+# the runtime will need the OpenMP shared lib as well.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        make \
+        libc6-dev \
+        libgomp1 \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# nvcc lives in the toolkit bin; the engine's Makefile resolves it from
+# CUDA_HOME which defaults to /usr/local/cuda (matching this image's layout).
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+# Make the runtime loader find libcudart.so at runtime; the engine binary
+# is linked with -Wl,-rpath,$(CUDA_HOME)/lib64, so this is only a belt-and-
+# braces fallback for tools that dlopen() the library dynamically.
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+WORKDIR /opt/colibri-build
+
+# Same cache-friendly layer order as the CPU Dockerfile: copy c/ first.
+COPY c/ /opt/colibri-build/c/
+
+# ARCH arg has the same meaning as in the CPU Dockerfile.
+ARG ARCH=native
+# CUDA_HOME and PATH are exported above so `make CUDA=1` resolves nvcc
+# and cudart without further help. We pass CUDA_DLL=0 explicitly to
+# disable the Windows runtime-loader path — we're on Linux, and the
+# direct-link path (-lcudart into the binary) is what we want.
+RUN make -C c glm ARCH=${ARCH} CUDA=1 CUDA_DLL=0
+
+# ---------- runtime stage: just libcudart + libgomp + python ----------
+FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# libcudart.so and the driver stub libcuda.so already live in the
+# nvidia/cuda:*-runtime base at /usr/local/cuda/lib64/. The engine
+# binary is linked with -Wl,-rpath pointing at that directory
+# (see c/Makefile:192), so it finds libcudart without any further help.
+# We don't need to copy any CUDA libraries across stages.
+
+# Runtime deps: libgomp (for OpenMP kernels), libstdc++ (for the CUDA
+# helper symbols), python3 (for the CLI), and the libcudart shipped in
+# the nvidia/cuda:*-runtime base.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 \
+        python3 \
+        python3-pip \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3 /usr/bin/python
+
+# huggingface_hub: same purpose as the CPU image. No torch (the
+# CUDA image is already 5 GB+; we keep the fetcher lean).
+RUN pip install --no-cache-dir --break-system-packages \
+        "huggingface_hub>=0.24,<1.0"
+
+# Carry the engine binary and the CLI into the runtime image.
+COPY --from=builder /opt/colibri-build/c/glm          /opt/colibri/c/glm
+COPY --from=builder /opt/colibri-build/c/coli         /opt/colibri/c/coli
+COPY --from=builder /opt/colibri-build/c/openai_server.py /opt/colibri/c/openai_server.py
+COPY --from=builder /opt/colibri-build/c/resource_plan.py /opt/colibri/c/resource_plan.py
+COPY --from=builder /opt/colibri-build/c/doctor.py    /opt/colibri/c/doctor.py
+COPY --from=builder /opt/colibri-build/c/tools        /opt/colibri/c/tools
+
+COPY docker/healthcheck.py /opt/colibri/docker/healthcheck.py
+# Entrypoint wrapper + HF downloader. The wrapper is a shell script
+# that exec's into the engine, so SIGINT/SIGTERM still reach the
+# engine's handler. See plans/hf-auto-download.md for the design.
+COPY docker/entrypoint.sh /opt/colibri/docker/entrypoint.sh
+COPY docker/hf_fetch.py  /opt/colibri/docker/hf_fetch.py
+RUN chmod +x /opt/colibri/c/coli /opt/colibri/docker/entrypoint.sh /opt/colibri/docker/hf_fetch.py /opt/colibri/docker/healthcheck.py
+
+# CUDA_HOME is needed at runtime too: the engine reads it to discover
+# the toolkit location (for the CUDA driver API). The runtime base
+# image already installs CUDA at /usr/local/cuda, so this matches.
+ENV CUDA_HOME=/usr/local/cuda
+ENV COLI_MODEL=/models/glm52_i4
+ENV PATH=/opt/colibri/c:${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+ENV PYTHONUNBUFFERED=1
+# Note: COLI_CUDA=1 is intentionally NOT set here. The compose file's
+# gpu profile sets it in the environment block. Keeping it out of the
+# image means the same image can be used CPU-only if you forget to use
+# the profile, instead of hard-failing at startup because no GPU is
+# visible. Set COLI_CUDA=0 in the environment to force CPU-only.
+
+EXPOSE 8000
+
+# Entrypoint wrapper. When COLI_HF_REPO is set, it pulls the model
+# from Hugging Face before launching the engine. When unset, it is
+# a passthrough (zero cost).
+ENTRYPOINT ["/opt/colibri/docker/entrypoint.sh"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "8000"]

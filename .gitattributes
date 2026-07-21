@@ -1,0 +1,103 @@
+# Auto-apply LF line endings for the colibrì source tree.
+#
+# Without this, Windows checkouts of the repo put CRLF into Python, shell,
+# and Makefile files, which breaks shebangs like
+#     #!/usr/bin/env python3
+# inside Linux containers (env cannot find "python3\r"). gcc/clang tolerate
+# CRLF in .c/.h/.cu files, so we don't need to force them.
+#
+# Binary assets MUST be marked `binary` or Git will refuse to read them
+# after the working-tree CRLF→LF conversion mangles their last bytes.
+#
+# To re-apply LF after cloning on Windows:
+#   git config core.autocrlf false
+#   git rm --cached -r .
+#   git reset --hard
+
+# Default for everything not explicitly listed: text=auto (let git decide
+# per-content if it looks binary).
+* text=auto
+
+# All Python files must be LF.
+*.py text eol=lf
+*.pyi text eol=lf
+*.pyx text eol=lf
+
+# Shell scripts (the c/coli CLI, the scripts/ helpers, etc.) — LF,
+# because these are run inside Linux containers.
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Windows-style scripts. Keep CRLF — they are run by Windows shells.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Makefile and build glue.
+Makefile text eol=lf
+*.mk text eol=lf
+*.mak text eol=lf
+GNUmakefile text eol=lf
+
+# YAML, JSON, INI, TOML, env files (compose, lint, editor config).
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
+*.conf text eol=lf
+*.env text eol=lf
+
+# Docker and ignore files.
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Markdown and other text docs.
+*.md text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+*.tsv text eol=lf
+
+# C/C++/CUDA source: gcc/nvcc tolerate CRLF, but staying LF is cleaner and
+# matches what the build will normalize to inside the container anyway.
+*.c text eol=lf
+*.h text eol=lf
+*.cc text eol=lf
+*.cpp text eol=lf
+*.cxx text eol=lf
+*.hpp text eol=lf
+*.m text eol=lf
+*.mm text eol=lf
+*.cu text eol=lf
+
+# Plan and docs.
+plans/** text eol=lf
+docs/** text eol=lf
+
+# Binary assets — must NOT be touched by CRLF normalization. Without the
+# `binary` attribute, Git's clean filter on a working-tree CRLF→LF conversion
+# will corrupt the last few bytes of any file that happens to end with
+# 0d 0a. We had this exact bug: docs/media/*.png lost 4 bytes each and
+# needed a `git checkout` to recover.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.bz2 binary
+*.xz binary
+*.7z binary
+*.rar binary
